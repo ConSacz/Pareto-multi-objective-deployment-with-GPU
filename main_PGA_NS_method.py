@@ -1,7 +1,12 @@
-#-------- Implementation of basic GPU-parallel Genetic Algorithm for with python CUDA using Numba  ---------#
+# try:
+#     from IPython import get_ipython
+#     get_ipython().run_line_magic('reset', '-f')
+# except:
+#     pass
 
+#-------- Implementation of basic GPU-parallel Genetic Algorithm for with python CUDA using Numba  ---------#
 import numpy as np
-from numba import cuda
+from numba import cuda, int32, float32
 import time
 import math
 import matplotlib.pyplot as plt
@@ -15,40 +20,119 @@ print(cuda.gpus)
 
 
 #%%-------- Parallel kernel function using CUDA  ---------#
+# %% Connectivity Constraint
 @cuda.jit(device=True)
-def Cov_Func(pos, rs, Obstacle_Area, Covered_Area):
-    size_x, size_y = Obstacle_Area.shape
-    N=len(pos)/2
+def connectivity_kernel(Positions, rc, count):
+    N = len(Positions[:])//2
+    for i in range(N):
+        xi = Positions[i*2]
+        yi = Positions[i*2+1]
+        for j in range(N):
+            xj = Positions[j*2]
+            yj = Positions[j*2+1]
+            dx = xi - xj
+            dy = yi - yj
+            if 0 < dx * dx + dy * dy <= rc * rc:
+                if count[i] == 0 and count[j] == 0:
+                    # atomic section update
+                    count[i] = i + 1
+                    count[j] = i + 1
+                elif count[i] == 0 and count[j] != 0:
+                    count[i] = count[j]
+                elif count[i] != 0 and count[j] == 0:
+                    count[j] = count[i]
+                elif count[i] != 0 and count[j] != 0:
+                    min_val = min(count[i], count[j])
+                    count[i] = min_val
+                    count[j] = min_val
+    for i in range(N):
+        if count[i] != 1:
+            return 0
+    return 1
+# %% Coverage Function
+@cuda.jit(device=True)
+def Cov_Func(Positions, rs, OA, CA):
+    size_x, size_y = OA.shape
+    N = len(Positions[:])//2
     count = 0
-    for j in range (N):
-        x0 = pos[j*2-1]
-        y0 = pos[j*2]
-        rsJ = rs[j]
-        for xi in range(1,size_x):
-            for yi in range(1,size_y):
+    for xi in range(size_x):
+        for yi in range(size_y):
+            for j in range (N):
+                x0 = Positions[j*2]
+                y0 = Positions[j*2+1]
+                rsJ = rs[j]
                 dx = xi - x0
                 dy = yi - y0
                 dist = math.sqrt(dx * dx + dy * dy)
                 if dist <= rsJ:
-                    if Obstacle_Area[xi, yi] == 1:
-                        if Covered_Area[xi, yi] == 1:
-                            continue
-                        else:
-                            Covered_Area[xi, yi] = 1
-                            count = count + 1
-                    elif Obstacle_Area[xi, yi] == 0:
-                        Covered_Area[xi, yi] = -2
-    return count/(size_x*size_y)                    
-# @cuda.jit(device=True)
-# def Liti_Func(pos,rc):
-#     N = pos.shape[0]
-#     adj_matrix = np.zeros((N, N))
-#     for i in range(N):
-#         for j in range(N):
-#             if i != j:
-#                 dist = np.linalg.norm(pos[i, :2] - pos[j, :2])
-#                 if dist <= rc:
-#                     adj_matrix[i, j] = dist
+                    if OA[xi, yi] == 1:
+                        CA[xi, yi] = 1
+                        count = count + 1
+                        break
+                    elif OA[xi, yi] == 0:
+                        CA[xi, yi] = -2
+                        break
+                    
+    return count/(size_x*size_y)
+
+# %% Lifetime Function
+@cuda.jit(device=True)
+def dijkstra_path(adj_matrix, N, start_node, path_out, path_len_out):
+    visited = cuda.local.array(100, dtype=int32)
+    dist = cuda.local.array(100, dtype=float32)
+    prev = cuda.local.array(100, dtype=int32)
+
+    for i in range(N):
+        visited[i] = 0
+        dist[i] = float('inf')
+        prev[i] = -1
+
+    dist[start_node] = 0
+
+    for _ in range(N):
+        # tìm node chưa thăm có dist nhỏ nhất
+        min_dist = float('inf')
+        u = -1
+        for v in range(N):
+            if not visited[v] and dist[v] < min_dist:
+                min_dist = dist[v]
+                u = v
+
+        if u == -1:
+            break
+
+        visited[u] = 1
+
+        for v in range(N):
+            if not visited[v] and adj_matrix[u, v] > 0:
+                alt = dist[u] + adj_matrix[u, v]
+                if alt < dist[v]:
+                    dist[v] = alt
+                    prev[v] = u
+
+    # reconstruct path từ start_node về 0
+    path_idx = 0
+    u = 0
+    while u != -1:
+        path_out[path_idx] = u
+        path_idx += 1
+        u = prev[u]
+
+    path_len_out[0] = path_idx
+    
+@cuda.jit(device=True)
+def Liti_Func(Positions,rc, adj_matrix):
+    N = len(Positions[:])//2
+    for i in range(N):
+        for j in range(N):
+            if i != j:
+                d0 = Positions[i*2] - Positions[j*2]
+                d1 = Positions[i*2+1] - Positions[j*2+1]
+                dist = math.sqrt(d0 * d0 + d1 * d1)
+                if dist <= rc:
+                    adj_matrix[i, j] = dist
+
+# %% MOO Function
 @cuda.jit
 def eval_genomes_kernel(Positions, Costs, stat, OA, CA):
     nPop = len(Positions)
@@ -64,33 +148,14 @@ def eval_genomes_kernel(Positions, Costs, stat, OA, CA):
     if i < nPop:  # Check array boundaries
   # in this example the fitness of an individual is computed by an arbitary set of algebraic operations on the chromosome
         # Costs[i,:] = CostFunction_MOO(Positions[i,:].reshape(60, 2), stat, np.ones((size, size), dtype=int), np.zeros((size, size), dtype=int))
-        #Costs[i,0] = Cov_Func(Positions[i,:],rs,OA,CA)
-        size_x, size_y = OA.shape
-        N=len(Positions[i,:])/2
-        count = 0
-        for j in range (N):
-            x0 = Positions[i,:][j*2-1]
-            y0 = Positions[i,:][j*2]
-            rsJ = rs[j]
-            for xi in range(1,size_x):
-                for yi in range(1,size_y):
-                    dx = xi - x0
-                    dy = yi - y0
-                    dist = math.sqrt(dx * dx + dy * dy)
-                    if dist <= rsJ:
-                        if OA[xi, yi] == 1:
-                            if CA[xi, yi] == 1:
-                                continue
-                            else:
-                                CA[xi, yi] = 1
-                                count = count + 1
-                        elif OA[xi, yi] == 0:
-                            CA[xi, yi] = -2
+        Costs[i,0] = Cov_Func(Positions[i,:],rs,OA,CA)
+        
+        
 #%%-------- Initialize Population  ---------#
 np.random.seed(0)
-nPop = 500
+nPop = 200
 N = 60
-MaxIt = 2
+MaxIt = 1
 size = 100
 
 # Network parameters
@@ -117,7 +182,7 @@ sigma = 0.1 * (100)           # Mutation Step Size
 # Init first pop
 pop = []
 for _ in range(nPop):
-    alpop = np.random.uniform(15, 85 , (N, 2))
+    alpop = np.random.uniform(45, 55 , (N, 2))
     alpop[0] = sink
     if Connectivity_graph(Graph(alpop, rc),[]):
         cost = CostFunction_MOO(alpop, stat, Obstacle_Area, Covered_Area.copy())
@@ -170,7 +235,7 @@ for it in range(MaxIt):
         mutated_pos = np.clip(mutated_pos, 0, 100)
         m = {
             'Position': mutated_pos,
-            'Cost': np.array([[1], [1]])
+            'Cost': np.array([[1.0], [1.0]])
         }
 
         popm.append(m)
@@ -178,17 +243,17 @@ for it in range(MaxIt):
     # ----- Merge -----
     popa = popc + popm
     
-    Positions = np.array([ind['Position'].flatten() for ind in popa])
-    Costs = np.array([ind['Cost'].flatten() for ind in popa])
-    Positions_GPU = cuda.to_device(Positions)
-    Costs_GPU = cuda.to_device(Costs)
-    
+    Positions_CPU = np.array([ind['Position'].flatten() for ind in popa])
+    Costs_CPU = np.array([ind['Cost'].flatten() for ind in popa])
+    Positions_GPU = cuda.to_device(Positions_CPU)
+    Costs_GPU = cuda.to_device(Costs_CPU)
+
     eval_genomes_kernel[blocks_per_grid, threads_per_block](Positions_GPU, Costs_GPU, stat_GPU, OA_GPU, CA_GPU)
     
-    Costs = Costs_GPU.copy_to_host()
+    Costs_CPU = Costs_GPU.copy_to_host()
     for k in range (len(popa)):
         if Connectivity_graph(Graph(popa[k]['Position'], rc),[]):
-            popa[k]['Cost'] = Costs[k,:]
+            popa[k]['Cost'] = Costs_CPU[k,:]
     
     pop = pop + popa
     pop, F = NS_Sort(pop)

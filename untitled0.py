@@ -24,13 +24,19 @@ def eval_genomes_kernel(chromosomes, fitnesses, pop_length, chrom_length):
   if pos < pop_length:  # Check array boundaries
   # in this example the fitness of an individual is computed by an arbitary set of algebraic operations on the chromosome
     num_loops = 3000
+    # for i in range(num_loops):
+    #   fitnesses[pos] += chromosomes[pos*chrom_length + 1] # do the fitness evaluation
+    # for i in range(num_loops):
+    #   fitnesses[pos] -= chromosomes[pos*chrom_length + 2]
+    # for i in range(num_loops):
+    #   fitnesses[pos] += chromosomes[pos*chrom_length + 3]
     for i in range(num_loops):
-      fitnesses[pos] += chromosomes[pos*chrom_length + 1] # do the fitness evaluation
+      fitnesses[pos] += chromosomes[pos][1] # do the fitness evaluation
     for i in range(num_loops):
-      fitnesses[pos] -= chromosomes[pos*chrom_length + 2]
+      fitnesses[pos] -= chromosomes[pos][2]
     for i in range(num_loops):
-      fitnesses[pos] += chromosomes[pos*chrom_length + 3]
-
+      fitnesses[pos] += chromosomes[pos][3]
+      
     if (fitnesses[pos] < 0):
       fitnesses[pos] = 0
     
@@ -176,9 +182,10 @@ start = time.time()
 # Genetic Algorithm on GPU
 for i in range(num_generations):
   print("Gen " + str(i) + "/" + str(num_generations))
-  chromosomes_flat = chromosomes.flatten()
-  chromo_GPU = cuda.to_device(chromosomes_flat)
+  #chromosomes_flat = chromosomes.flatten()
+  chromo_GPU = cuda.to_device(chromosomes)
   fit_GPU = cuda.to_device(fitnesses)
+  
   eval_genomes_kernel[blocks_per_grid, threads_per_block](chromo_GPU, fit_GPU, pop_size, chrom_size)
 
   fitnesses = fit_GPU.copy_to_host()
